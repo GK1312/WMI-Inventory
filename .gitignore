@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# IDE
+.idea/
+
+# graphify output (generated)
+graphify-out/
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
