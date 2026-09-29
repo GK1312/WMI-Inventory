@@ -18,11 +18,9 @@ LEVELS: dict[str, int] = {
     'CRITICAL': logging.CRITICAL,
 }
 
-
 def _data(self: logging.Logger, message: str, *args, **kwargs) -> None:
     if self.isEnabledFor(DATA):
         self._log(DATA, message, args, **kwargs)
-
 
 logging.Logger.data = _data
 
@@ -42,7 +40,6 @@ class JsonFormatter(logging.Formatter):
 _HUMAN_FORMAT = '%(asctime)s %(levelname)-7s %(name)s: %(message)s'
 
 _configured = False
-
 
 def setup_logging(settings, *, force: bool = False) -> None:
     global _configured

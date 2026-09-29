@@ -1,1 +1,5 @@
 python-dotenv
+psycopg[binary,pool]
+fastapi
+uvicorn[standard]
+cryptography
