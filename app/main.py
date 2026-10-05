@@ -90,6 +90,38 @@ def run_port_sweep(args: argparse.Namespace) -> int:
     return 0 if result.reachable else 3
 
 
+def run_msrpc_emp(args: argparse.Namespace) -> int:
+    from probes.msrpc_emp import msrpc_emp
+
+    try:
+        result = msrpc_emp(args.host, port=args.port, timeout=args.timeout)
+    except ValidationError as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 2
+    except AppError as exc:
+        logger.error('msrpc_emp %s failed: %s', args.host, exc)
+        print(f'error: {exc}', file=sys.stderr)
+        return 1
+    print(_format_json(result.to_dict()))
+    return 0 if result.reachable else 3
+
+
+def run_smb_ntlm(args: argparse.Namespace) -> int:
+    from probes.smb_ntlm import smb_ntlm
+
+    try:
+        result = smb_ntlm(args.host, port=args.port, timeout=args.timeout)
+    except ValidationError as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 2
+    except AppError as exc:
+        logger.error('smb_ntlm %s failed: %s', args.host, exc)
+        print(f'error: {exc}', file=sys.stderr)
+        return 1
+    print(_format_json(result.to_dict()))
+    return 0 if result.reachable else 3
+
+
 _VERBOSE_HELP = 'also print log lines (LOG_LEVEL from .env) and library notices'
 
 
@@ -117,6 +149,20 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument('--no-fallback', action='store_true', help='fail instead of falling back to a connect probe')
     sweep.add_argument('-v', '--verbose', action='store_true', help=_VERBOSE_HELP)
     sweep.set_defaults(handler=run_port_sweep)
+
+    emp = subparsers.add_parser('msrpc-emp', help='enumerate registered endpoints via the MSRPC endpoint mapper (port 135)')
+    emp.add_argument('host')
+    emp.add_argument('--port', type=int, default=135)
+    emp.add_argument('--timeout', type=float, default=2.0)
+    emp.add_argument('-v', '--verbose', action='store_true', help=_VERBOSE_HELP)
+    emp.set_defaults(handler=run_msrpc_emp)
+
+    smb = subparsers.add_parser('smb-ntlm', help='read the NTLM Type-2 challenge from an SMB session setup (port 445)')
+    smb.add_argument('host')
+    smb.add_argument('--port', type=int, default=445)
+    smb.add_argument('--timeout', type=float, default=2.0)
+    smb.add_argument('-v', '--verbose', action='store_true', help=_VERBOSE_HELP)
+    smb.set_defaults(handler=run_smb_ntlm)
 
     parser.set_defaults(handler=run_api)
     return parser
