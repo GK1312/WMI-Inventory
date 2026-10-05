@@ -28,3 +28,6 @@ class StrictError(AppError):
 
 class SecurityError(StrictError):
     pass
+
+class ProbeError(StrictError):
+    pass

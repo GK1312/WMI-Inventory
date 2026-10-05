@@ -3,3 +3,4 @@ psycopg[binary,pool]
 fastapi
 uvicorn[standard]
 cryptography
+scapy
