@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import ipaddress
 import os
+import random
 import selectors
 import socket
 import struct
@@ -29,17 +30,20 @@ MAX_TIMEOUT = 30.0
 _SYN_ACK = 0x12
 _RST = 0x04
 
+_EPHEMERAL_PORTS = (49152, 65535)
+
 _TCP_NOSYNRETRIES = 9
 _RCVALL_IPLEVEL = 3
 _CAPTURE_GRACE = 0.1
 _CAPTURE_BUFFER = 4 * 1024 * 1024
 
+_WSAEACCES = 10013
 _WSAEADDRNOTAVAIL = 10049
 
 _REFUSED_ERRNOS = {errno.ECONNREFUSED}
 _FILTERED_ERRNOS = {
     errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ETIMEDOUT, errno.ENETDOWN, errno.EHOSTDOWN,
-    errno.EACCES, errno.EPERM, _WSAEADDRNOTAVAIL,
+    errno.EACCES, errno.EPERM, _WSAEACCES, _WSAEADDRNOTAVAIL,
 }
 _IN_PROGRESS_ERRNOS = {errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EAGAIN}
 _LIMITED_BROADCAST = ipaddress.IPv4Address('255.255.255.255')
@@ -49,6 +53,7 @@ class PortState(str, Enum):
     OPEN = 'open'
     CLOSED = 'closed'
     FILTERED = 'filtered'
+    UNKNOWN = 'unknown'
 
 
 @dataclass(frozen=True)
@@ -70,7 +75,7 @@ class TcpPingResult:
 _STATE_PREFERENCE = (PortState.OPEN, PortState.CLOSED, PortState.FILTERED)
 
 
-def _validate_port(port: int) -> int:
+def validate_port(port: int) -> int:
     if isinstance(port, bool) or not isinstance(port, int):
         raise ValidationError(f'port must be an int, got {type(port).__name__}', field='port')
     if not 1 <= port <= 65535:
@@ -78,7 +83,7 @@ def _validate_port(port: int) -> int:
     return port
 
 
-def _validate_timeout(timeout: float) -> float:
+def validate_timeout(timeout: float) -> float:
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
         raise ValidationError(f'timeout must be a number, got {type(timeout).__name__}', field='timeout')
     if not 0 < timeout <= MAX_TIMEOUT:
@@ -92,7 +97,7 @@ def _check_target(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipa
     return address
 
 
-def _resolve(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+def resolve_host(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
     if not isinstance(host, str) or not host.strip():
         raise ValidationError('host must be a non-empty string', field='host')
     host = host.strip()
@@ -114,12 +119,14 @@ def _resolve(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
 def _validate_ports(port: int | None) -> tuple[int, ...]:
     if port is None:
         return DEFAULT_PORTS
-    return (_validate_port(port),)
+    return (validate_port(port),)
 
 
 def _build_packet(address: ipaddress.IPv4Address | ipaddress.IPv6Address, ports: tuple[int, ...]):
     network_layer = IP(dst=str(address)) if address.version == 4 else IPv6(dst=str(address))
-    return network_layer / TCP(dport=list(ports), flags='S')
+    return network_layer / TCP(
+        sport=random.randint(*_EPHEMERAL_PORTS), dport=list(ports), seq=random.getrandbits(31), flags='S',
+    )
 
 
 def _check_capability() -> None:
@@ -141,12 +148,12 @@ def _is_syn_ack_from(address: str, ports: tuple[int, ...]):
     return stop
 
 
-def _send(packet, address: str, ports: tuple[int, ...], timeout: float):
+def _send(packet, address: str, ports: tuple[int, ...], timeout: float, early_stop: bool = True):
     _check_capability()
     try:
         answered, _ = sr(
             packet, timeout=timeout, verbose=0, chainEX=True, promisc=False,
-            stop_filter=_is_syn_ack_from(address, ports),
+            stop_filter=_is_syn_ack_from(address, ports) if early_stop else None,
         )
     except PermissionError as exc:
         raise ProbeError('raw socket access denied; run with administrator/root privileges') from exc
@@ -176,10 +183,11 @@ def _is_tcp_reply(reply) -> bool:
     return reply.haslayer(TCP) and (reply.haslayer(IP) or reply.haslayer(IPv6))
 
 
-def _syn_probe(
-    host: str, address: ipaddress.IPv4Address | ipaddress.IPv6Address, ports: tuple[int, ...], timeout: float
+def syn_probe(
+    host: str, address: ipaddress.IPv4Address | ipaddress.IPv6Address, ports: tuple[int, ...], timeout: float,
+    early_stop: bool = True,
 ) -> list[TcpPingResult]:
-    answered = _send(_build_packet(address, ports), str(address), ports, timeout)
+    answered = _send(_build_packet(address, ports), str(address), ports, timeout, early_stop)
     by_port = {
         int(sent[TCP].dport): _classify(host, int(sent[TCP].dport), sent, reply)
         for sent, reply in answered
@@ -203,7 +211,8 @@ def _error_text(err: int) -> str:
 
 
 def _connect_result(
-    host: str, address: ipaddress.IPv4Address | ipaddress.IPv6Address, port: int, err: int, start: float
+    host: str, address: ipaddress.IPv4Address | ipaddress.IPv6Address, port: int, err: int, start: float,
+    strict: bool = True,
 ) -> TcpPingResult:
     if err == 0:
         state = PortState.OPEN
@@ -211,8 +220,11 @@ def _connect_result(
         state = PortState.CLOSED
     elif err in _FILTERED_ERRNOS:
         state = PortState.FILTERED
-    else:
+    elif strict:
         raise ProbeError(f'connect to {address}:{port} failed: {_error_text(err)} (errno {err})')
+    else:
+        logger.debug('connect to %s:%s failed: %s (errno %s), state unknown', address, port, _error_text(err), err)
+        return TcpPingResult(host, port, PortState.UNKNOWN, False)
     reachable = state in (PortState.OPEN, PortState.CLOSED)
     latency_ms = round((time.perf_counter() - start) * 1000, 2) if reachable else None
     return TcpPingResult(host, port, state, reachable, latency_ms=latency_ms)
@@ -296,20 +308,34 @@ class _ReplyCapture:
         self.sock.close()
 
 
-def _connect_probe(
-    host: str, address: ipaddress.IPv4Address | ipaddress.IPv6Address, ports: tuple[int, ...], timeout: float
+def connect_probe(
+    host: str, address: ipaddress.IPv4Address | ipaddress.IPv6Address, ports: tuple[int, ...], timeout: float,
+    early_stop: bool = True, strict: bool = True,
 ) -> list[TcpPingResult]:
     family = socket.AF_INET if address.version == 4 else socket.AF_INET6
     results: dict[int, TcpPingResult] = {}
     sockets: list[socket.socket] = []
     local_ports: dict[int, int] = {}
+    started: dict[int, float] = {}
     capture = _ReplyCapture.open(address)
     selector = selectors.DefaultSelector()
+
+    def settle(wait: float) -> None:
+        drain = False
+        for key, _ in selector.select(wait):
+            if key.data is None:
+                drain = True
+                continue
+            selector.unregister(key.fileobj)
+            err = key.fileobj.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            results[key.data] = _connect_result(host, address, key.data, err, started[key.data], strict)
+        if drain:
+            capture.drain(local_ports)
+
     try:
         if capture is not None:
             selector.register(capture.sock, selectors.EVENT_READ, None)
-        start = time.perf_counter()
-        deadline = start + timeout
+        deadline = time.perf_counter() + timeout
         for port in ports:
             sock = socket.socket(family, socket.SOCK_STREAM)
             sockets.append(sock)
@@ -319,25 +345,22 @@ def _connect_probe(
             if capture is not None:
                 sock.bind((capture.local_ip, 0))
                 local_ports[sock.getsockname()[1]] = port
+            started[port] = time.perf_counter()
             err = sock.connect_ex((str(address), port))
             if err in _IN_PROGRESS_ERRNOS:
                 selector.register(sock, selectors.EVENT_WRITE, port)
             else:
-                results[port] = _connect_result(host, address, port, err, start)
+                results[port] = _connect_result(host, address, port, err, started[port], strict)
+            if selector.get_map():
+                settle(0)
 
-        while len(selector.get_map()) > (capture is not None) and not any(
-            r.state is PortState.OPEN for r in results.values()
+        while len(selector.get_map()) > (capture is not None) and (
+            not early_stop or not any(r.state is PortState.OPEN for r in results.values())
         ):
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 break
-            for key, _ in selector.select(remaining):
-                if key.data is None:
-                    capture.drain(local_ports)
-                    continue
-                selector.unregister(key.fileobj)
-                err = key.fileobj.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-                results[key.data] = _connect_result(host, address, key.data, err, start)
+            settle(remaining)
 
         if capture is not None:
             capture.drain(local_ports)
@@ -368,16 +391,16 @@ def tcp_ping(
     host: str, port: int | None = None, timeout: float = DEFAULT_TIMEOUT, *, allow_fallback: bool = True
 ) -> TcpPingResult:
     ports = _validate_ports(port)
-    timeout = _validate_timeout(timeout)
-    address = _resolve(host)
+    timeout = validate_timeout(timeout)
+    address = resolve_host(host)
 
     try:
-        results = _syn_probe(host, address, ports, timeout)
+        results = syn_probe(host, address, ports, timeout)
     except ProbeError as exc:
         if not allow_fallback:
             raise
         logger.debug('tcp_ping SYN probe unavailable, using connect fallback: %s', exc)
-        results = _connect_probe(host, address, ports, timeout)
+        results = connect_probe(host, address, ports, timeout)
 
     result = _pick_best(results)
     logger.data('tcp_ping %s ports %s -> %s', host, list(ports), result.to_dict())
